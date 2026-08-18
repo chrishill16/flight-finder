@@ -17,6 +17,19 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Debug — raw curl to Duffel (bypasses Python entirely)
+        env:
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+        run: |
+          curl -s -D - -o /tmp/body.json \
+            -X POST "https://api.duffel.com/air/offer_requests" \
+            -H "Content-Type: application/json" \
+            -H "Duffel-Version: v2" \
+            -H "Authorization: Bearer $DUFFEL_API_KEY" \
+            -d '{"data":{"slices":[{"origin":"LHR","destination":"JFK","departure_date":"2026-12-18"}],"passengers":[{"type":"adult"}]}}'
+          echo "--- BODY ---"
+          cat /tmp/body.json
+
       - name: Run flight search
         env:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
