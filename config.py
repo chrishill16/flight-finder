@@ -46,7 +46,12 @@ FLAG_BUSINESS_IF_GAP_UNDER_PCT = 40  # if business is within 40% of economy pric
 # "OUTBOUND_ONLY"  = one-way, SYD -> UK, no return leg searched
 # "INBOUND_ONLY"   = one-way, UK -> SYD — the fallback fare check against staff travel
 # "BEST_OF"        = check all four, report each as its own section
-TRIP_SHAPE = "BEST_OF"
+#
+# Set to OUTBOUND_ONLY for now — the main use case, and far cheaper to run
+# (~50 requests vs 2,000+ for BEST_OF, which needs the return window too and
+# eats into Duffel's rate limit and GitHub Actions' free minutes fast).
+# Switch back to "BEST_OF" any time a full comparison is worth the longer run.
+TRIP_SHAPE = "OUTBOUND_ONLY"
 
 # --- Exclusions ---
 # Mainland Chinese carriers only — Cathay Pacific (CX, Hong Kong) is explicitly OK.
