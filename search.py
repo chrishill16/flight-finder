@@ -13,15 +13,19 @@ WHAT THIS DOES
 WHAT THIS DOESN'T DO YET
   - Email/notification delivery
   - The return-leg fallback check (separate small script, same pattern)
-  - GitHub Actions scheduling wrapper
+  - GitHub Actions scheduling wrapper (already built — see .github/workflows/)
 
-WHY DUFFEL
+WHY DUFFEL, AND WHY RAW REQUESTS INSTEAD OF THEIR SDK
   - Real self-service signup, no accreditation needed — the direct replacement for
     what Amadeus's self-service tier used to be
+  - Duffel moved to API version v2; the community `duffel-api` PyPI package (last
+    published version, 0.6.2) still hardcodes v1 and its response parser breaks on
+    v2's field names. Rather than depend on an unmaintained SDK, this talks to the
+    REST API directly with `requests` — fewer moving parts, and we're not blocked
+    next time the SDK falls behind the live API again.
   - Search is free up to a 1,500:1 search-to-book ratio; we never book through the
     API (booking happens manually / via staff travel), so this stays free in practice
-  - Sandbox mode uses fake data — switch DUFFEL_LIVE=1 once the logic is verified,
-    still free for search-only usage
+  - Sandbox vs live is just which key you use — same code either way
   - Sign up: https://duffel.com  (needs Chris's own account + API key, stored as a
     GitHub Actions secret, same pattern as the ai-digest project)
 """
@@ -31,15 +35,24 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from duffel_api import Duffel
+import requests
 
 import config
 
-# Auth: reads from environment — set locally for testing, or as a GitHub Actions
-# secret (DUFFEL_API_KEY) for the scheduled job. Sandbox and live keys look the
-# same to this code — which one you get depends on which key you generate in
-# the Duffel dashboard.
-duffel = Duffel(access_token=os.environ.get("DUFFEL_API_KEY"))
+DUFFEL_API_URL = "https://api.duffel.com/air/offer_requests"
+DUFFEL_VERSION = "v2"  # bump this if Duffel deprecates v2 in future — see their
+                        # versioning docs, old versions stay live ~6 months after
+                        # a new one ships
+
+
+def _duffel_headers() -> dict:
+    return {
+        "Accept-Encoding": "gzip",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Duffel-Version": DUFFEL_VERSION,
+        "Authorization": f"Bearer {os.environ.get('DUFFEL_API_KEY')}",
+    }
 
 
 @dataclass
@@ -52,6 +65,7 @@ class FlightOption:
     airline_codes: list[str] = field(default_factory=list)
     transit_airports: list[str] = field(default_factory=list)
     price_aud: float = 0.0
+    currency: str = "?"
     discounted_price_aud: float | None = None  # set only if the QF discount applies
     is_qantas_discounted: bool = False
     excluded_reason: str | None = None  # set if this got filtered out — kept for
@@ -76,41 +90,48 @@ def _duffel_passengers() -> list[dict]:
 
 
 def fetch_offers(origin: str, destination: str, depart_date: str,
-                  return_date: str | None, cabin: str):
-    """
-    Real Duffel Offer Request call. Returns a list of Offer objects (Duffel's SDK
-    types, not raw dicts — see models/offer.py for the shape).
-    """
+                  return_date: str | None, cabin: str) -> list[dict]:
+    """Real Duffel Offer Request call — raw REST, v2. Returns a list of offer dicts."""
     slices = [{"origin": origin, "destination": destination, "departure_date": depart_date}]
     if return_date:
         slices.append(
             {"origin": destination, "destination": origin, "departure_date": return_date}
         )
 
+    body = {
+        "data": {
+            "cabin_class": cabin.lower(),
+            "passengers": _duffel_passengers(),
+            "slices": slices,
+        }
+    }
+
     try:
-        offer_request = (
-            duffel.offer_requests.create()
-            .cabin_class(cabin.lower())
-            .passengers(_duffel_passengers())
-            .slices(slices)
-            .return_offers()  # get offers back immediately, no separate fetch needed
-            .execute()
+        response = requests.post(
+            f"{DUFFEL_API_URL}?return_offers=true",
+            headers=_duffel_headers(),
+            json=body,
+            timeout=30,
         )
-        return offer_request.offers or []
-    except Exception as error:
+        response.raise_for_status()
+        return response.json().get("data", {}).get("offers", [])
+    except requests.RequestException as error:
         # Don't let one failed route/date combo kill the whole run — log and move on.
-        print(f"  [warn] {origin}->{destination} {depart_date}: {error}")
+        detail = ""
+        if error.response is not None:
+            detail = f" — {error.response.text[:200]}"
+        print(f"  [warn] {origin}->{destination} {depart_date}: {error}{detail}")
         return []
 
 
-def _all_segments(offer):
+def _all_segments(offer: dict):
     """Flatten every segment across every slice (outbound + return) in one offer."""
-    for travel_slice in offer.slices:
-        for segment in travel_slice.segments:
+    for travel_slice in offer.get("slices", []):
+        for segment in travel_slice.get("segments", []):
             yield segment
 
 
-def violates_exclusions(offer) -> str | None:
+def violates_exclusions(offer: dict) -> str | None:
     """
     Hard filter: mainland Chinese carriers, and any Middle East transit airport.
     Checks BOTH the marketing carrier and the operating carrier on every segment —
@@ -118,29 +139,29 @@ def violates_exclusions(offer) -> str | None:
     codeshare, and that's exactly the case worth catching rather than missing.
     Returns a human-readable reason string if excluded, else None.
     """
-    segments = list(_all_segments(offer))
-    for segment in segments:
-        marketing_code = segment.marketing_carrier.iata_code
-        operating_code = segment.operating_carrier.iata_code
+    for segment in _all_segments(offer):
+        marketing_code = segment.get("marketing_carrier", {}).get("iata_code")
+        operating_code = segment.get("operating_carrier", {}).get("iata_code")
 
         for carrier in (marketing_code, operating_code):
             if carrier in config.EXCLUDED_AIRLINES:
-                return (
-                    f"excluded airline: {carrier} "
-                    f"(segment {segment.origin.iata_code}->{segment.destination.iata_code})"
-                )
+                origin = segment.get("origin", {}).get("iata_code")
+                dest = segment.get("destination", {}).get("iata_code")
+                return f"excluded airline: {carrier} (segment {origin}->{dest})"
 
     # Any segment's arrival airport that isn't the final leg destination is a transit
     # point. Check every segment except the last one in each slice.
-    for travel_slice in offer.slices:
-        for segment in travel_slice.segments[:-1]:
-            if segment.destination.iata_code in config.EXCLUDED_TRANSIT_AIRPORTS:
-                return f"excluded transit airport: {segment.destination.iata_code}"
+    for travel_slice in offer.get("slices", []):
+        segments = travel_slice.get("segments", [])
+        for segment in segments[:-1]:
+            transit_code = segment.get("destination", {}).get("iata_code")
+            if transit_code in config.EXCLUDED_TRANSIT_AIRPORTS:
+                return f"excluded transit airport: {transit_code}"
 
     return None
 
 
-def apply_qantas_discount(offer, base_price: float) -> tuple[float | None, bool]:
+def apply_qantas_discount(offer: dict, base_price: float) -> tuple[float | None, bool]:
     """
     Applies the 25% staff discount IF every segment is genuinely QF-operated
     (confirmed scope — operating carrier must be QF, not just marketed as QF).
@@ -150,7 +171,9 @@ def apply_qantas_discount(offer, base_price: float) -> tuple[float | None, bool]
     if not segments:
         return None, False
 
-    all_qf_operated = all(segment.operating_carrier.iata_code == "QF" for segment in segments)
+    all_qf_operated = all(
+        segment.get("operating_carrier", {}).get("iata_code") == "QF" for segment in segments
+    )
 
     if not all_qf_operated:
         return None, False
@@ -167,18 +190,20 @@ def check_business_class_gap(economy_price: float, business_price: float) -> boo
     return gap_pct <= config.FLAG_BUSINESS_IF_GAP_UNDER_PCT
 
 
-def _build_option(offer, destination: str, depart_date: str,
+def _build_option(offer: dict, destination: str, depart_date: str,
                    return_date: str | None, trip_shape: str, cabin: str) -> FlightOption:
-    price = float(offer.total_amount)
+    price = float(offer.get("total_amount", 0))
+    currency = offer.get("total_currency", "?")
     exclusion_reason = violates_exclusions(offer)
     discounted_price, is_discounted = apply_qantas_discount(offer, price)
 
     segments = list(_all_segments(offer))
-    airline_codes = sorted({s.marketing_carrier.iata_code for s in segments})
+    airline_codes = sorted({s.get("marketing_carrier", {}).get("iata_code") for s in segments})
 
     transit_airports = []
-    for travel_slice in offer.slices:
-        transit_airports += [s.destination.iata_code for s in travel_slice.segments[:-1]]
+    for travel_slice in offer.get("slices", []):
+        segs = travel_slice.get("segments", [])
+        transit_airports += [s.get("destination", {}).get("iata_code") for s in segs[:-1]]
 
     return FlightOption(
         destination=destination,
@@ -189,6 +214,7 @@ def _build_option(offer, destination: str, depart_date: str,
         airline_codes=airline_codes,
         transit_airports=transit_airports,
         price_aud=price,
+        currency=currency,
         discounted_price_aud=discounted_price,
         is_qantas_discounted=is_discounted,
         excluded_reason=exclusion_reason,
@@ -248,9 +274,9 @@ def format_report(results: list[FlightOption]) -> str:
     lines = [f"flight-watch report — {len(kept)} valid options, {len(excluded)} excluded\n"]
 
     for r in kept[:15]:  # top 15, cheapest first
-        price_line = f"${r.price_aud:,.0f} AUD"
+        price_line = f"${r.price_aud:,.0f} {r.currency}"
         if r.is_qantas_discounted:
-            price_line += f" -> ${r.discounted_price_aud:,.0f} AUD (QF staff discount applied)"
+            price_line += f" -> ${r.discounted_price_aud:,.0f} {r.currency} (QF staff discount applied)"
 
         route = " -> ".join([config.ORIGIN] + r.transit_airports + [r.destination])
         lines.append(

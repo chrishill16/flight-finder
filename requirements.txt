@@ -1,1 +1,1 @@
-duffel-api
+requests
