@@ -89,15 +89,18 @@ def _duffel_passengers() -> list[dict]:
     return passengers
 
 
-def fetch_offers(origin: str, destination: str, depart_date: str,
-                  return_date: str | None, cabin: str) -> list[dict]:
-    """Real Duffel Offer Request call — raw REST, v2. Returns a list of offer dicts."""
-    slices = [{"origin": origin, "destination": destination, "departure_date": depart_date}]
-    if return_date:
-        slices.append(
-            {"origin": destination, "destination": origin, "departure_date": return_date}
-        )
+def fetch_offers(slices: list[dict], cabin: str) -> list[dict]:
+    """
+    Real Duffel Offer Request call — raw REST, v2. Returns a list of offer dicts.
 
+    `slices` is the literal list Duffel expects: one dict per leg, each with
+    origin/destination/departure_date. The caller builds this explicitly —
+    one slice for one-way, two for return or open-jaw — so RETURN (same city
+    both ways) and OPEN_JAW (different cities) can never be confused with each
+    other. Earlier versions of this file built the return slice internally
+    assuming it always went back to the same city, which silently made
+    OPEN_JAW behave like a plain one-way search.
+    """
     body = {
         "data": {
             "cabin_class": cabin.lower(),
@@ -120,7 +123,8 @@ def fetch_offers(origin: str, destination: str, depart_date: str,
         detail = ""
         if error.response is not None:
             detail = f" — {error.response.text[:200]}"
-        print(f"  [warn] {origin}->{destination} {depart_date}: {error}{detail}")
+        route_desc = " | ".join(f"{s['origin']}->{s['destination']} {s['departure_date']}" for s in slices)
+        print(f"  [warn] {route_desc}: {error}{detail}")
         return []
 
 
@@ -224,71 +228,161 @@ def _build_option(offer: dict, destination: str, depart_date: str,
 
 def run_search() -> list[FlightOption]:
     """
-    Checks every destination x depart-date x trip-shape x cabin combination.
+    Checks every destination x depart-date x trip-shape x cabin combination,
+    across four genuinely different shapes:
+
+      RETURN         same city out and back
+      OPEN_JAW       fly into one city, home from another
+      OUTBOUND_ONLY  SYD -> UK one-way, no return leg searched
+      INBOUND_ONLY   UK -> SYD one-way — a real fallback fare check against
+                     staff travel, not searched at all until now
+
     This is the part that manual chat searches genuinely can't do — a handful of
     web searches sample a few combos; this loops every one of them against the
     live Duffel fare database.
+
+    Note on volume: OPEN_JAW's destination-pair loop multiplies calls fastest
+    (pairs x depart dates x return dates x cabins). Trim config.DESTINATIONS or
+    narrow the return window if a run gets too slow or eats into Duffel's free
+    search quota.
     """
     results: list[FlightOption] = []
     depart_dates = list(daterange(config.DEPART_WINDOW_START, config.DEPART_WINDOW_END))
+    return_dates = list(daterange(config.RETURN_WINDOW_START, config.RETURN_WINDOW_END))
     cabins = [config.CABIN_DEFAULT, "BUSINESS"]
 
     shapes_to_check = (
-        ["RETURN", "OPEN_JAW"] if config.TRIP_SHAPE == "BEST_OF" else [config.TRIP_SHAPE]
+        ["RETURN", "OPEN_JAW", "OUTBOUND_ONLY", "INBOUND_ONLY"]
+        if config.TRIP_SHAPE == "BEST_OF" else [config.TRIP_SHAPE]
     )
 
-    for destination, depart_date, cabin in itertools.product(
-        config.DESTINATIONS, depart_dates, cabins
-    ):
-        for shape in shapes_to_check:
-            return_date = None
-            if shape == "RETURN":
-                # Simple case for the skeleton — a fixed 14-night stay from depart_date.
-                # Real return dates are on staff travel per config, so this return-shape
-                # price only matters as a point of comparison, not a booking target.
-                return_date = (
-                    datetime.strptime(depart_date, "%Y-%m-%d") + timedelta(days=14)
-                ).strftime("%Y-%m-%d")
+    for shape in shapes_to_check:
+        if shape == "RETURN":
+            for destination, depart_date, return_date, cabin in itertools.product(
+                config.DESTINATIONS, depart_dates, return_dates, cabins
+            ):
+                slices = [
+                    {"origin": config.ORIGIN, "destination": destination, "departure_date": depart_date},
+                    {"origin": destination, "destination": config.ORIGIN, "departure_date": return_date},
+                ]
+                offers = fetch_offers(slices, cabin)
+                for offer in offers:
+                    results.append(_build_option(offer, destination, depart_date, return_date, shape, cabin))
 
-            offers = fetch_offers(config.ORIGIN, destination, depart_date, return_date, cabin)
+        elif shape == "OPEN_JAW":
+            destination_pairs = [
+                (in_city, out_city)
+                for in_city in config.DESTINATIONS
+                for out_city in config.DESTINATIONS
+                if in_city != out_city
+            ]
+            for (in_city, out_city), depart_date, return_date, cabin in itertools.product(
+                destination_pairs, depart_dates, return_dates, cabins
+            ):
+                slices = [
+                    {"origin": config.ORIGIN, "destination": in_city, "departure_date": depart_date},
+                    {"origin": out_city, "destination": config.ORIGIN, "departure_date": return_date},
+                ]
+                offers = fetch_offers(slices, cabin)
+                for offer in offers:
+                    label = f"{in_city}->{out_city}"
+                    results.append(_build_option(offer, label, depart_date, return_date, shape, cabin))
 
-            for offer in offers:
-                option = _build_option(offer, destination, depart_date, return_date, shape, cabin)
-                results.append(option)
+        elif shape == "OUTBOUND_ONLY":
+            for destination, depart_date, cabin in itertools.product(
+                config.DESTINATIONS, depart_dates, cabins
+            ):
+                slices = [
+                    {"origin": config.ORIGIN, "destination": destination, "departure_date": depart_date},
+                ]
+                offers = fetch_offers(slices, cabin)
+                for offer in offers:
+                    results.append(_build_option(offer, destination, depart_date, None, shape, cabin))
+
+        elif shape == "INBOUND_ONLY":
+            # `destination` on the resulting FlightOption is the UK city this leg
+            # departs FROM, not arrives at — inbound-only has no outbound leg to
+            # anchor the usual meaning. format_report labels this shape clearly.
+            for uk_city, return_date, cabin in itertools.product(
+                config.DESTINATIONS, return_dates, cabins
+            ):
+                slices = [
+                    {"origin": uk_city, "destination": config.ORIGIN, "departure_date": return_date},
+                ]
+                offers = fetch_offers(slices, cabin)
+                for offer in offers:
+                    results.append(_build_option(offer, uk_city, return_date, None, shape, cabin))
 
     return results
 
 
+def _route_string(raw_itinerary: dict) -> str:
+    """
+    Builds the full route straight from the raw offer — every leg, every stop —
+    rather than a simplified label. This matters most for OPEN_JAW, where the
+    outbound and return legs use different cities and both need to be visible
+    to actually see what's being compared.
+    """
+    leg_strings = []
+    for travel_slice in raw_itinerary.get("slices", []):
+        segments = travel_slice.get("segments", [])
+        if not segments:
+            continue
+        airports = [segments[0].get("origin", {}).get("iata_code")]
+        airports += [s.get("destination", {}).get("iata_code") for s in segments]
+        leg_strings.append(" -> ".join(a for a in airports if a))
+    return "  |  ".join(leg_strings) if leg_strings else "?"
+
+
 def format_report(results: list[FlightOption]) -> str:
     """
-    Human-readable summary. Shows full routing for every kept result — not just
-    price — so a misread exclusion is easy to catch by eye rather than trusted blind.
-    Excluded offers are shown too (collapsed), so a filtering bug is visible rather
-    than silently invisible.
+    Human-readable summary, grouped by trip shape — return, open-jaw, outbound-only,
+    inbound-only — shown as separate sections rather than blended into one
+    price-sorted list, since a one-way fare and a return fare aren't a fair
+    "cheapest" comparison against each other.
+
+    Shows full routing for every kept result — not just price — so a misread
+    exclusion is easy to catch by eye rather than trusted blind. Excluded offers
+    are summarised once at the end across all shapes, so a filtering bug stays
+    visible rather than silently invisible.
     """
     kept = [r for r in results if r.excluded_reason is None]
     excluded = [r for r in results if r.excluded_reason is not None]
 
-    kept.sort(key=lambda r: r.discounted_price_aud or r.price_aud)
+    shape_labels = {
+        "RETURN": "Return flights",
+        "OPEN_JAW": "Open-jaw (fly into one city, home from another)",
+        "OUTBOUND_ONLY": "Outbound only (SYD -> UK)",
+        "INBOUND_ONLY": "Inbound only (UK -> SYD)",
+    }
 
     lines = [f"flight-watch report — {len(kept)} valid options, {len(excluded)} excluded\n"]
 
-    for r in kept[:15]:  # top 15, cheapest first
-        price_line = f"${r.price_aud:,.0f} {r.currency}"
-        if r.is_qantas_discounted:
-            price_line += f" -> ${r.discounted_price_aud:,.0f} {r.currency} (QF staff discount applied)"
-
-        route = " -> ".join([config.ORIGIN] + r.transit_airports + [r.destination])
-        lines.append(
-            f"{r.destination} | {r.depart_date}"
-            + (f" - {r.return_date}" if r.return_date else " (one-way)")
-            + f" | {r.trip_shape} | {r.cabin}\n"
-            f"  {price_line}\n"
-            f"  route: {route}  |  airlines: {', '.join(r.airline_codes)}\n"
+    for shape, label in shape_labels.items():
+        shape_results = sorted(
+            (r for r in kept if r.trip_shape == shape),
+            key=lambda r: r.discounted_price_aud or r.price_aud,
         )
+        if not shape_results:
+            continue
+
+        lines.append(f"=== {label} ({len(shape_results)} options) ===\n")
+        for r in shape_results[:5]:  # top 5 per shape
+            price_line = f"${r.price_aud:,.0f} {r.currency}"
+            if r.is_qantas_discounted:
+                price_line += f" -> ${r.discounted_price_aud:,.0f} {r.currency} (QF staff discount applied)"
+
+            route = _route_string(r.raw_itinerary)
+            date_desc = f"{r.depart_date} - {r.return_date}" if r.return_date else r.depart_date
+
+            lines.append(
+                f"{r.destination} | {date_desc} | {r.cabin}\n"
+                f"  {price_line}\n"
+                f"  route: {route}  |  airlines: {', '.join(r.airline_codes)}\n"
+            )
 
     if excluded:
-        lines.append(f"\n{len(excluded)} offers excluded (sample reasons):")
+        lines.append(f"\n{len(excluded)} offers excluded across all shapes (sample reasons):")
         seen_reasons = set()
         for r in excluded:
             if r.excluded_reason not in seen_reasons:
