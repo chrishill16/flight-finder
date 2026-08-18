@@ -32,6 +32,7 @@ WHY DUFFEL, AND WHY RAW REQUESTS INSTEAD OF THEIR SDK
 
 import itertools
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -43,6 +44,21 @@ DUFFEL_API_URL = "https://api.duffel.com/air/offer_requests"
 DUFFEL_VERSION = "v2"  # bump this if Duffel deprecates v2 in future — see their
                         # versioning docs, old versions stay live ~6 months after
                         # a new one ships
+
+# Duffel's search endpoint allows 120 requests per 60 seconds. Throttling to one
+# request every 0.6s keeps us comfortably under that with margin, rather than
+# firing as fast as the loop can go and hitting 429s immediately — which is
+# exactly what happened without this.
+_MIN_REQUEST_INTERVAL_SECONDS = 0.6
+_last_request_time = 0.0
+
+
+def _throttle():
+    global _last_request_time
+    elapsed = time.monotonic() - _last_request_time
+    if elapsed < _MIN_REQUEST_INTERVAL_SECONDS:
+        time.sleep(_MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+    _last_request_time = time.monotonic()
 
 
 def _duffel_headers() -> dict:
@@ -89,7 +105,7 @@ def _duffel_passengers() -> list[dict]:
     return passengers
 
 
-def fetch_offers(slices: list[dict], cabin: str) -> list[dict]:
+def fetch_offers(slices: list[dict], cabin: str, max_retries: int = 4) -> list[dict]:
     """
     Real Duffel Offer Request call — raw REST, v2. Returns a list of offer dicts.
 
@@ -97,9 +113,11 @@ def fetch_offers(slices: list[dict], cabin: str) -> list[dict]:
     origin/destination/departure_date. The caller builds this explicitly —
     one slice for one-way, two for return or open-jaw — so RETURN (same city
     both ways) and OPEN_JAW (different cities) can never be confused with each
-    other. Earlier versions of this file built the return slice internally
-    assuming it always went back to the same city, which silently made
-    OPEN_JAW behave like a plain one-way search.
+    other.
+
+    Every call is throttled (see _throttle) to stay under Duffel's rate limit.
+    If a 429 slips through anyway, retries with exponential backoff — honouring
+    the Retry-After header if Duffel sends one, otherwise 2s/4s/8s/16s.
     """
     body = {
         "data": {
@@ -108,24 +126,41 @@ def fetch_offers(slices: list[dict], cabin: str) -> list[dict]:
             "slices": slices,
         }
     }
+    route_desc = " | ".join(f"{s['origin']}->{s['destination']} {s['departure_date']}" for s in slices)
 
-    try:
-        response = requests.post(
-            f"{DUFFEL_API_URL}?return_offers=true",
-            headers=_duffel_headers(),
-            json=body,
-            timeout=30,
-        )
-        response.raise_for_status()
+    for attempt in range(max_retries + 1):
+        _throttle()
+        try:
+            response = requests.post(
+                f"{DUFFEL_API_URL}?return_offers=true",
+                headers=_duffel_headers(),
+                json=body,
+                timeout=30,
+            )
+        except requests.RequestException as error:
+            print(f"  [warn] {route_desc}: {error}")
+            return []
+
+        if response.status_code == 429:
+            if attempt >= max_retries:
+                print(f"  [warn] {route_desc}: rate limited, giving up after {max_retries} retries")
+                return []
+            retry_after = response.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else min(2 ** attempt * 2, 30)
+            print(f"  [rate-limited] {route_desc}: waiting {wait:.0f}s (retry {attempt + 1}/{max_retries})")
+            time.sleep(wait)
+            continue
+
+        try:
+            response.raise_for_status()
+        except requests.RequestException as error:
+            detail = f" — {error.response.text[:200]}" if error.response is not None else ""
+            print(f"  [warn] {route_desc}: {error}{detail}")
+            return []
+
         return response.json().get("data", {}).get("offers", [])
-    except requests.RequestException as error:
-        # Don't let one failed route/date combo kill the whole run — log and move on.
-        detail = ""
-        if error.response is not None:
-            detail = f" — {error.response.text[:200]}"
-        route_desc = " | ".join(f"{s['origin']}->{s['destination']} {s['departure_date']}" for s in slices)
-        print(f"  [warn] {route_desc}: {error}{detail}")
-        return []
+
+    return []
 
 
 def _all_segments(offer: dict):
